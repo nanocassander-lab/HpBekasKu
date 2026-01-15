@@ -13,7 +13,7 @@ st.set_page_config(page_title="Dashboard HP Bekas", layout="wide")
 DEFAULT_DATA_URL = "https://raw.githubusercontent.com/nanocassander-lab/HpBekasKu/main/hp_device_clean.csv"
 DATA_URL = st.secrets.get("DATA_URL", os.getenv("DATA_URL", DEFAULT_DATA_URL))
 
-st.title("📱 Dashboard Analitik HP Bekas (Clean Data)")
+st.title("📱 Dashboard Analitik HP Bekas")
 st.caption(
     "Dataset: hasil cleaning dari hp_device_data.csv. "
     "Catatan: kolom harga bersifat *normalized* (bukan Rupiah)."
