@@ -1,5 +1,7 @@
 import os
 import io
+from typing import Dict, List, Tuple
+
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -79,6 +81,83 @@ num_cols = [
 ]
 for c in num_cols:
     df[c] = pd.to_numeric(df[c], errors="coerce")
+
+# =========================
+# Helper: Content-based recommender (Cosine Similarity)
+# =========================
+FEATURE_LABELS: Dict[str, str] = {
+    "release_year": "Release Year",
+    "days_used": "Days Used",
+    "age_years": "Age (Years)",
+    "screen_size": "Screen Size (inch)",
+    "ram_gb": "RAM (GB)",
+    "storage_gb": "Storage (GB)",
+    "rear_cam_mp": "Rear Camera (MP)",
+    "front_cam_mp": "Front Camera (MP)",
+    "battery_mah": "Battery (mAh)",
+    "weight_g": "Weight (gram)",
+    "used_price_norm": "Used Price (Normalized)",
+    "new_price_norm": "New Price (Normalized)",
+    "depreciation_norm": "Depreciation (Norm) = new - used",
+    "used_to_new_ratio": "Used/New Ratio",
+}
+
+# Default fitur untuk rekomendasi (selaras dengan contoh pada laporan: RAM, Storage, Battery)
+DEFAULT_RECO_FEATURES: List[str] = ["ram_gb", "storage_gb", "battery_mah"]
+
+
+@st.cache_data(show_spinner=False)
+def compute_minmax_params(df_: pd.DataFrame, features: Tuple[str, ...]) -> Dict[str, Tuple[float, float]]:
+    """Hitung min-max untuk setiap fitur berdasarkan *dataset penuh* (lebih stabil meskipun filter berubah)."""
+    params: Dict[str, Tuple[float, float]] = {}
+    for f in features:
+        s = pd.to_numeric(df_[f], errors="coerce")
+        lo = float(np.nanmin(s.values)) if np.isfinite(np.nanmin(s.values)) else 0.0
+        hi = float(np.nanmax(s.values)) if np.isfinite(np.nanmax(s.values)) else 1.0
+        # fallback aman jika data aneh
+        if not np.isfinite(lo):
+            lo = 0.0
+        if not np.isfinite(hi):
+            hi = 1.0
+        params[f] = (lo, hi)
+    return params
+
+
+def minmax_scale_array(x: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    x = x.astype(float)
+    if np.isclose(lo, hi):
+        return np.zeros_like(x, dtype=float)
+    return (x - lo) / (hi - lo)
+
+
+def build_weighted_matrix(
+    dff_: pd.DataFrame,
+    features: List[str],
+    params: Dict[str, Tuple[float, float]],
+    weights: Dict[str, float],
+) -> np.ndarray:
+    """Bangun matriks fitur ter-normalisasi (min-max) dan dibobot."""
+    cols = []
+    for f in features:
+        lo, hi = params[f]
+        v = pd.to_numeric(dff_[f], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        v_scaled = minmax_scale_array(v, lo, hi)
+        cols.append(v_scaled * float(weights.get(f, 1.0)))
+    X = np.vstack(cols).T  # (n, m)
+    return X
+
+
+def cosine_similarity(X: np.ndarray, u: np.ndarray) -> np.ndarray:
+    """Cosine similarity antara setiap baris X dan vektor u."""
+    u = np.asarray(u, dtype=float)
+    u_norm = np.linalg.norm(u)
+    if u_norm == 0:
+        return np.zeros(X.shape[0], dtype=float)
+    X_norm = np.linalg.norm(X, axis=1)
+    denom = X_norm * u_norm
+    sim = np.divide(X.dot(u), denom, out=np.zeros_like(X_norm, dtype=float), where=denom != 0)
+    # Clamp untuk keamanan tampilan
+    return np.clip(sim, -1.0, 1.0)
 
 # =========================
 # Sidebar filter
@@ -165,7 +244,223 @@ if len(dff) == 0:
 # =========================
 # Tabs
 # =========================
-tab1, tab2, tab3, tab4 = st.tabs(["📌 Overview", "💰 Pricing", "⚙️ Specs", "📄 Data"])
+tab_reco, tab1, tab2, tab3, tab4 = st.tabs(["🎯 Recommendation", "📌 Overview", "💰 Pricing", "⚙️ Specs", "📄 Data"])
+
+# =========================
+# Recommendation (Content-Based + Cosine Similarity)
+# =========================
+with tab_reco:
+    st.subheader("🎯 Top-N Recommendation (Cosine Similarity)")
+    st.caption(
+        "Rekomendasi berbasis atribut (content-based). "
+        "Fitur numerik akan di-*min-max normalize* (0-1), lalu dihitung kemiripannya "
+        "menggunakan cosine similarity. Kandidat yang dipakai adalah *data setelah filter* di sidebar."
+    )
+
+    if len(dff) < 2:
+        st.warning("Data hasil filter terlalu sedikit untuk rekomendasi. Coba longgarkan filter.")
+    else:
+        mode = st.radio(
+            "Mode rekomendasi",
+            [
+                "Berdasarkan Preferensi (input)",
+                "Berdasarkan Item (cari yang mirip dengan 1 listing)",
+            ],
+            horizontal=True,
+        )
+
+        feature_options = list(FEATURE_LABELS.keys())
+
+        # Pakai min-max dari dataset penuh agar stabil meskipun filter berubah
+        minmax_params = compute_minmax_params(df, tuple(feature_options))
+
+        st.markdown("#### 1) Pilih fitur untuk menghitung kemiripan")
+        features = st.multiselect(
+            "Fitur numerik (untuk vektor content-based)",
+            options=feature_options,
+            default=DEFAULT_RECO_FEATURES,
+            format_func=lambda x: FEATURE_LABELS.get(x, x),
+        )
+
+        if not features:
+            st.info("Pilih minimal 1 fitur agar bisa menghitung cosine similarity.")
+        else:
+            st.markdown("#### 2) Preferensi & bobot")
+            left, right = st.columns([2, 1])
+
+            weights: Dict[str, float] = {}
+            user_values: Dict[str, float] = {}
+
+            with left:
+                if mode == "Berdasarkan Preferensi (input)":
+                    st.write("Masukkan nilai preferensi untuk tiap fitur yang dipilih.")
+                    for f in features:
+                        lo, hi = minmax_params[f]
+                        # default: median dari dataset penuh
+                        default_val = float(pd.to_numeric(df[f], errors="coerce").median())
+                        # langkah (step) sederhana agar input nyaman
+                        span = float(hi - lo)
+                        step = span / 100.0 if span > 0 else 0.1
+                        step = 0.1 if step <= 0 else step
+                        user_values[f] = st.number_input(
+                            f"Preferensi: {FEATURE_LABELS.get(f, f)}",
+                            min_value=float(lo),
+                            max_value=float(hi),
+                            value=float(np.clip(default_val, lo, hi)),
+                            step=float(step),
+                            key=f"pref_{f}",
+                        )
+
+                else:
+                    # Mode item-to-item: pilih satu listing sebagai query
+                    st.write("Pilih 1 listing sebagai *query item* (akan dicarikan yang paling mirip).")
+                    # buat label ringkas agar mudah dicari di selectbox
+                    dff_small = dff[[
+                        "listing_id",
+                        "brand",
+                        "os",
+                        "release_year",
+                        "ram_gb",
+                        "storage_gb",
+                        "used_price_norm",
+                    ]].copy()
+                    dff_small["label"] = (
+                        dff_small["listing_id"].astype(str)
+                        + " | "
+                        + dff_small["brand"].astype(str)
+                        + " | "
+                        + dff_small["os"].astype(str)
+                        + " | "
+                        + dff_small["release_year"].astype(int).astype(str)
+                        + " | RAM "
+                        + dff_small["ram_gb"].round(1).astype(str)
+                        + "GB | Storage "
+                        + dff_small["storage_gb"].round(0).astype(int).astype(str)
+                        + "GB | Used "
+                        + dff_small["used_price_norm"].round(2).astype(str)
+                    )
+                    label_to_id = dict(zip(dff_small["label"], dff_small["listing_id"]))
+                    selected_label = st.selectbox(
+                        "Pilih listing",
+                        options=list(label_to_id.keys()),
+                        key="query_listing",
+                    )
+                    query_id = int(label_to_id[selected_label])
+                    query_row = dff[dff["listing_id"] == query_id].iloc[0]
+                    for f in features:
+                        user_values[f] = float(query_row[f])
+
+                st.caption("Tips: Anda bisa memperketat/longgarkan kandidat menggunakan filter sidebar (brand, OS, tahun, RAM, dll).")
+
+            with right:
+                st.write("Atur bobot fitur (opsional)")
+                for f in features:
+                    weights[f] = st.slider(
+                        f"Bobot: {FEATURE_LABELS.get(f, f)}",
+                        0.0,
+                        5.0,
+                        1.0,
+                        0.1,
+                        key=f"w_{f}",
+                    )
+
+            st.markdown("#### 3) Hitung Top-N")
+            topn = st.slider("Top N rekomendasi", 3, 50, 10)
+            use_value = st.checkbox(
+                "Gabungkan dengan skor 'value for money' (1 - used_to_new_ratio)",
+                value=True,
+            )
+
+            w_sim = 1.0
+            if use_value:
+                w_sim = st.slider("Bobot similarity (w_sim)", 0.0, 1.0, 0.8, 0.05)
+            w_val = 1.0 - w_sim
+
+            # Bangun matriks fitur kandidat (dff) + vektor user
+            X = build_weighted_matrix(dff, features, minmax_params, weights)
+            u_vec = []
+            for f in features:
+                lo, hi = minmax_params[f]
+                u_scaled = minmax_scale_array(np.array([user_values[f]], dtype=float), lo, hi)[0]
+                u_vec.append(u_scaled * float(weights.get(f, 1.0)))
+            u = np.array(u_vec, dtype=float)
+
+            sim = cosine_similarity(X, u)
+
+            reco = dff.copy()
+            reco["similarity"] = sim
+            # value_score: semakin kecil used/new, semakin besar value
+            reco["value_score"] = (1.0 - pd.to_numeric(reco["used_to_new_ratio"], errors="coerce")).clip(0.0, 1.0)
+
+            if use_value:
+                reco["final_score"] = (w_sim * reco["similarity"]) + (w_val * reco["value_score"])
+            else:
+                reco["final_score"] = reco["similarity"]
+
+            # Jika mode item-to-item, jangan rekomendasikan item yang sama
+            if mode == "Berdasarkan Item (cari yang mirip dengan 1 listing)":
+                reco = reco.sort_values(["final_score"], ascending=False)
+                # buang query_id jika ada
+                try:
+                    reco = reco[reco["listing_id"] != query_id]
+                except Exception:
+                    pass
+
+            reco_top = reco.sort_values(["final_score"], ascending=False).head(topn)
+
+            st.success(f"Menampilkan Top-{len(reco_top)} rekomendasi dari {len(dff):,} kandidat hasil filter.")
+
+            show_cols = [
+                "listing_id",
+                "brand",
+                "os",
+                "release_year",
+                "ram_gb",
+                "storage_gb",
+                "battery_mah",
+                "screen_size",
+                "used_price_norm",
+                "new_price_norm",
+                "depreciation_norm",
+                "used_to_new_ratio",
+                "similarity",
+                "value_score",
+                "final_score",
+            ]
+            show_cols = [c for c in show_cols if c in reco_top.columns]
+
+            st.dataframe(
+                reco_top[show_cols],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            # Download hasil rekomendasi
+            csv_buf = io.StringIO()
+            reco_top[show_cols].to_csv(csv_buf, index=False)
+            st.download_button(
+                label="⬇️ Download Top-N rekomendasi (CSV)",
+                data=csv_buf.getvalue().encode("utf-8"),
+                file_name="hp_device_recommendation_topn.csv",
+                mime="text/csv",
+            )
+
+            with st.expander("ℹ️ Detail metode", expanded=False):
+                st.markdown(
+                    """
+**Representasi fitur**
+- Setiap listing HP direpresentasikan sebagai vektor dari fitur numerik yang Anda pilih.
+- Nilai fitur diubah menjadi skala 0–1 dengan *min-max normalization* berdasarkan dataset penuh.
+
+**Cosine Similarity**
+- Kemiripan dihitung dengan rumus:  
+  \( \text{sim}(u, i) = \frac{u \cdot i}{\|u\| \; \|i\|} \)
+
+**Skor akhir (opsional)**
+- Jika Anda mengaktifkan opsi value, skor akhir dihitung:
+  \( \text{final} = w_{sim} \cdot sim + (1-w_{sim}) \cdot (1-\text{used\_to\_new\_ratio}) \)
+"""
+                )
 
 with tab1:
     colA, colB = st.columns(2)
